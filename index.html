@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Guías Diagnósticas — GPC IMSS / NOM</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.11.0/dist/tabler-icons.min.css"/>
+
+<!-- Firebase SDK -->
+<script type="module">
+import { initializeApp }    from "https://www.gstatic.com/firebasejs/11.8.1/firebase-app.js";
+import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, query, where, orderBy, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/11.8.1/firebase-firestore.js";
+
+/* ══════════════════════════════════════════
+   🔥 REEMPLAZA CON TU CONFIG DE FIREBASE
+   Firebase Console → Tu proyecto → </> Web
+══════════════════════════════════════════ */
+const firebaseConfig = {
+  apiKey:            "AIzaSyCJ3KuZhJopIVFq5gtx04jCLzANqcU2g3k",
+  authDomain:        "guias-diagnostico.firebaseapp.com",
+  projectId:         "guias-diagnostico",
+  storageBucket:     "guias-diagnostico.firebasestorage.app",
+  messagingSenderId: "642519932254",
+  appId:             "1:642519932254:web:74a62368700d067b3ac3cf"
+};
+
+const app = initializeApp(firebaseConfig);
+const db  = getFirestore(app);
+
+/* ID anónimo estable por navegador — se genera una sola vez y persiste */
+function getDeviceId() {
+  let id = localStorage.getItem('gd_device_id');
+  if (!id) {
+    id = 'dev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 9);
+    localStorage.setItem('gd_device_id', id);
+  }
+  return id;
+}
+const DEVICE_ID = getDeviceId();
+
+/* ─── PROMPTS ─── */
+const SYSTEM_DX = `Eres un asistente clínico especializado en las Guías de Práctica Clínica (GPC) del IMSS (https://www.imss.gob.mx/guias_practicaclinica) y en las Normas Oficiales Mexicanas de salud (https://www.gob.mx/salud/documentos/normas-oficiales-mexicanas-9705).
+Cuando el estudiante pregunta sobre el diagnóstico de una enfermedad, busca en esas fuentes y responde SOLO con un objeto JSON (sin markdown, sin backticks, sin texto adicional):
+{"titulo":"Nombre oficial","cie10":"CIE-10 o null","fuente":"Guía consultada","definicion":"Definición clínica 2-3 oraciones","criterios_diagnosticos":[{"tipo":"mayor|menor|hallazgo|laboratorio","descripcion":"criterio"}],"pasos_diagnosticos":["Paso 1..."],"valores_de_corte":[{"parametro":"nombre","valor":"valor referencia","categoria":"normal|alterado|critico"}],"diagnostico_diferencial":["Condición 1"],"alertas":[{"tipo":"warning|danger|info","mensaje":"alerta"}]}
+Responde ÚNICAMENTE el JSON.`;
+
+const SYSTEM_QUIZ = `Eres un profesor de medicina clínica. Genera un caso clínico realista sobre la enfermedad indicada.
+Responde SOLO con JSON (sin markdown ni backticks):
+{"caso":"Descripción del paciente: edad, sexo, síntomas, signos vitales, hallazgos. 4-6 oraciones.","diagnostico_correcto":"Nombre del diagnóstico","cie10":"CIE-10"}`;
+
+const SYSTEM_EVAL = `Eres un evaluador clínico. Evalúa la respuesta diagnóstica del estudiante.
+Responde SOLO con JSON (sin markdown ni backticks):
+{"puntuacion":85,"nivel":"correcto|parcial|incorrecto","diagnostico_correcto":"...","positivo":"Lo que hizo bien (2 oraciones)","mejorar":"Qué le faltó (2 oraciones)","consejo":"Un consejo clínico clave (1 oración)"}`;
+
+/* ─── STATE ─── */
+let currentResult   = null;
+let currentQuizData = null;
+let fsHistory       = [];
+
+/* ══════════════════════════════════════════
+   CLAUDE API
+══════════════════════════════════════════ */
+async function callClaude(system, userMsg, useSearch) {
+  const r = await fetch('/api/claude', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ system, messages: [{ role: 'user', content: userMsg }], useSearch })
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  const txt = data.content?.find(b => b.type === 'text');
+  if (!txt) throw new Error('Sin respuesta de texto');
+  return JSON.parse(txt.text.replace(/```json|```/g, '').trim());
+}
+
+/* ══════════════════════════════════════════
+   TABS
+══════════════════════════════════════════ */
+window.switchTab = function(name) {
+  ['buscar','quiz','historial'].forEach(t => {
+    document.getElementById('tab-'+t).classList.toggle('active', t===name);
+    document.getElementById('panel-'+t).classList.toggle('active', t===name);
+  });
+  if (name === 'historial') renderHistory();
+};
+
+/* ══════════════════════════════════════════
+   BÚSQUEDA
+══════════════════════════════════════════ */
+const loadMsgs = [
+  'Consultando guías clínicas del IMSS y NOM...',
+  'Buscando criterios diagnósticos oficiales...',
+  'Procesando información clínica...',
+  'Estructurando la guía diagnóstica...'
+];
+
+window.fillQuery = q => { document.getElementById('query').value = q; window.runSearch(); };
+
+window.runSearch = async function() {
+  const q = document.getElementById('query').value.trim();
+  if (!q) return;
+  setLoading(true); hideError();
+  document.getElementById('resultCard').classList.remove('visible');
+  document.getElementById('emptyState').style.display = 'none';
+  let mi = 0;
+  const iv = setInterval(() => {
+    mi = (mi+1) % loadMsgs.length;
+    const el = document.getElementById('loadingMsg');
+    if (el) el.textContent = loadMsgs[mi];
+  }, 2000);
+  try {
+    const result = await callClaude(SYSTEM_DX, q, true);
+    currentResult = result; clearInterval(iv);
+    renderResult(result);
+  } catch(e) {
+    clearInterval(iv);
+    showError('No se pudo obtener la guía: ' + e.message);
+    document.getElementById('emptyState').style.display = 'block';
+  } finally { setLoading(false); }
+};
+
+function renderResult(data) {
+  document.getElementById('diagTitle').textContent   = data.titulo || 'Diagnóstico';
+  document.getElementById('sourceLabel').textContent = data.fuente  || 'GPC-IMSS / NOM';
+  const cb = document.getElementById('cieBadge');
+  if (data.cie10) { cb.textContent = data.cie10; cb.style.display = 'block'; } else { cb.style.display = 'none'; }
+
+  const labels   = {mayor:'Criterio mayor',menor:'Criterio menor',hallazgo:'Hallazgo clínico',laboratorio:'Laboratorio / Gabinete'};
+  const clsMap   = {mayor:'major',menor:'minor',hallazgo:'finding',laboratorio:'lab'};
+  const alertIco = {warning:'ti-alert-triangle',danger:'ti-urgent',info:'ti-info-circle'};
+  const catPill  = {normal:'green',alterado:'amber',critico:'red'};
+
+  let html = '';
+  if (data.definicion)
+    html += `<div class="section"><div class="section-title"><i class="ti ti-info-circle"></i> Definición clínica</div><p style="font-size:14px;line-height:1.65">${data.definicion}</p></div>`;
+
+  if (data.criterios_diagnosticos?.length) {
+    html += `<div class="section"><div class="section-title"><i class="ti ti-list-check"></i> Criterios diagnósticos</div><div class="criteria-grid">`;
+    for (const c of data.criterios_diagnosticos)
+      html += `<div class="criteria-item ${clsMap[c.tipo]||''}"><div class="criteria-label">${labels[c.tipo]||c.tipo}</div><div class="criteria-value">${c.descripcion}</div></div>`;
+    html += `</div></div>`;
+  }
+  if (data.pasos_diagnosticos?.length) {
+    html += `<div class="section"><div class="section-title"><i class="ti ti-route"></i> Proceso diagnóstico</div><div class="steps-list">`;
+    data.pasos_diagnosticos.forEach((s,i) =>
+      html += `<div class="step-item"><div class="step-num">${i+1}</div><div class="step-text">${s.replace(/^Paso\s*\d+[:.\s]*/i,'')}</div></div>`);
+    html += `</div></div>`;
+  }
+  if (data.valores_de_corte?.length) {
+    html += `<div class="section"><div class="section-title"><i class="ti ti-ruler-measure"></i> Valores de corte</div><div class="criteria-grid">`;
+    for (const v of data.valores_de_corte)
+      html += `<div class="criteria-item lab" style="display:flex;flex-direction:column;gap:6px">
+        <div class="criteria-label">${v.parametro}</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+          <span style="font-size:14px;font-weight:500">${v.valor}</span>
+          <span class="pill ${catPill[v.categoria]||'blue'}" style="font-size:11px">${v.categoria}</span>
+        </div></div>`;
+    html += `</div></div>`;
+  }
+  if (data.diagnostico_diferencial?.length) {
+    html += `<div class="section"><div class="section-title"><i class="ti ti-arrows-diff"></i> Diagnóstico diferencial</div><div class="pills-row">`;
+    for (const dd of data.diagnostico_diferencial) html += `<span class="pill blue">${dd}</span>`;
+    html += `</div></div>`;
+  }
+  if (data.alertas?.length) {
+    html += `<div class="section"><div class="section-title"><i class="ti ti-alert-triangle"></i> Alertas clínicas</div><div style="display:flex;flex-direction:column;gap:8px">`;
+    for (const a of data.alertas)
+      html += `<div class="alert-box ${a.tipo}"><i class="ti ${alertIco[a.tipo]||'ti-info-circle'}"></i><span>${a.mensaje}</span></div>`;
+    html += `</div></div>`;
+  }
+
+  document.getElementById('resultBody').innerHTML = html;
+  document.getElementById('resultCard').classList.add('visible');
+  document.getElementById('saveBtn').innerHTML = '<i class="ti ti-bookmark"></i> Guardar';
+}
+
+function setLoading(on) {
+  document.getElementById('loading').classList.toggle('visible', on);
+  const btn = document.getElementById('searchBtn');
+  btn.disabled = on;
+  btn.innerHTML = on
+    ? '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> Buscando...'
+    : '<i class="ti ti-search"></i> Consultar';
+}
+function showError(msg) { document.getElementById('errorMsg').textContent = msg; document.getElementById('errorBox').classList.add('visible'); }
+function hideError()    { document.getElementById('errorBox').classList.remove('visible'); }
+
+/* ══════════════════════════════════════════
+   FIRESTORE — HISTORIAL (sin auth, por deviceId)
+══════════════════════════════════════════ */
+async function loadHistory() {
+  try {
+    const q = query(
+      collection(db, 'historial'),
+      where('deviceId', '==', DEVICE_ID),
+      orderBy('savedAt', 'desc')
+    );
+    const snap = await getDocs(q);
+    fsHistory = snap.docs.map(d => ({ fsId: d.id, ...d.data() }));
+  } catch(e) {
+    console.warn('Historial no disponible:', e.message);
+    fsHistory = [];
+  }
+}
+
+window.saveToHistory = async function() {
+  if (!currentResult) return;
+  try {
+    const entry = {
+      deviceId: DEVICE_ID,
+      query:    document.getElementById('query').value,
+      savedAt:  serverTimestamp(),
+      ...currentResult,
+    };
+    const ref = await addDoc(collection(db, 'historial'), entry);
+    fsHistory.unshift({ fsId: ref.id, ...entry, savedAt: new Date() });
+    document.getElementById('saveBtn').innerHTML = '<i class="ti ti-bookmark-filled"></i> Guardado';
+    showToast('Guía guardada en el historial ✓');
+  } catch(e) { showToast('Error al guardar: ' + e.message); }
+};
+
+function renderHistory() {
+  const el = document.getElementById('historyContent');
+  if (!fsHistory.length) {
+    el.innerHTML = `<div class="history-empty"><i class="ti ti-history"></i><p>Sin consultas guardadas aún</p><small>Usa el botón "Guardar" en cada guía diagnóstica</small></div>`;
+    return;
+  }
+  let html = `<button class="history-clear-btn" onclick="clearHistory()"><i class="ti ti-trash"></i> Limpiar historial</button><div class="history-list">`;
+  for (const h of fsHistory) {
+    const date = h.savedAt?.toDate
+      ? h.savedAt.toDate().toLocaleDateString('es-MX', {day:'2-digit',month:'short',year:'numeric'})
+      : (h.savedAt instanceof Date ? h.savedAt.toLocaleDateString('es-MX') : '—');
+    const safe = encodeURIComponent(JSON.stringify(h));
+    html += `<div class="history-item" onclick="loadHistoryItem('${safe}')">
+      <div class="history-icon"><i class="ti ti-stethoscope"></i></div>
+      <div class="history-info">
+        <div class="history-title">${h.titulo||'—'}</div>
+        <div class="history-meta">${h.fuente||'GPC-IMSS'} · ${date}</div>
+      </div>
+      ${h.cie10 ? `<div class="history-cie">${h.cie10}</div>` : ''}
+      <button class="history-del" onclick="event.stopPropagation();deleteItem('${h.fsId}')"><i class="ti ti-x"></i></button>
+    </div>`;
+  }
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+window.loadHistoryItem = function(enc) {
+  const data = JSON.parse(decodeURIComponent(enc));
+  currentResult = data;
+  if (data.query) document.getElementById('query').value = data.query;
+  window.switchTab('buscar');
+  document.getElementById('emptyState').style.display = 'none';
+  renderResult(data);
+};
+
+window.deleteItem = async function(fsId) {
+  try {
+    await deleteDoc(doc(db, 'historial', fsId));
+    fsHistory = fsHistory.filter(h => h.fsId !== fsId);
+    renderHistory();
+  } catch(e) { showToast('Error al eliminar: ' + e.message); }
+};
+
+window.clearHistory = async function() {
+  if (!confirm('¿Eliminar todo el historial de este dispositivo?')) return;
+  try {
+    await Promise.all(fsHistory.map(h => deleteDoc(doc(db, 'historial', h.fsId))));
+    fsHistory = [];
+    renderHistory();
+    showToast('Historial eliminado');
+  } catch(e) { showToast('Error: ' + e.message); }
+};
+
+/* ══════════════════════════════════════════
+   QUIZ
+══════════════════════════════════════════ */
+const quizMsgs = ['Generando caso clínico...','Añadiendo signos y síntomas...','Ajustando dificultad del caso...'];
+
+window.runQuiz = async function() {
+  const q = document.getElementById('quizQuery').value.trim();
+  if (!q) return;
+  setQuizLoading(true);
+  document.getElementById('quizArea').style.display = 'none';
+  document.getElementById('quizFeedback').classList.remove('visible');
+  document.getElementById('quizAnswer').value = '';
+  let mi = 0;
+  const iv = setInterval(() => { mi=(mi+1)%quizMsgs.length; const el=document.getElementById('quizMsg'); if(el) el.textContent=quizMsgs[mi]; }, 1800);
+  try {
+    const data = await callClaude(SYSTEM_QUIZ, `Genera un caso clínico de: ${q}`, false);
+    currentQuizData = data; clearInterval(iv);
+    document.getElementById('quizCaseText').textContent = data.caso;
+    document.getElementById('quizArea').style.display = 'block';
+  } catch(e) { clearInterval(iv); showToast('Error: ' + e.message); }
+  finally { setQuizLoading(false); }
+};
+
+window.evaluateQuiz = async function() {
+  const answer = document.getElementById('quizAnswer').value.trim();
+  if (!answer) { showToast('Escribe tu diagnóstico primero'); return; }
+  if (!currentQuizData) return;
+  const btn = document.getElementById('evalBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> Evaluando...';
+  try {
+    const ctx = `Caso: ${currentQuizData.caso}\nDiagnóstico correcto: ${currentQuizData.diagnostico_correcto}\nRespuesta del estudiante: ${answer}`;
+    const ev  = await callClaude(SYSTEM_EVAL, ctx, false);
+    renderFeedback(ev);
+  } catch(e) { showToast('Error: ' + e.message); }
+  finally { btn.disabled = false; btn.innerHTML = '<i class="ti ti-check"></i> Evaluar mi respuesta'; }
+};
+
+function renderFeedback(ev) {
+  const score = ev.puntuacion || 0;
+  const level = ev.nivel || (score >= 75 ? 'correcto' : score >= 45 ? 'parcial' : 'incorrecto');
+  const labels = {correcto:'Diagnóstico correcto ✓',parcial:'Parcialmente correcto',incorrecto:'Diagnóstico incorrecto'};
+  const subs   = {correcto:'¡Bien hecho! Repasa los detalles.',parcial:'Vas por buen camino.',incorrecto:'Estudia los criterios diagnósticos.'};
+  document.getElementById('feedbackHeader').className  = 'feedback-header ' + level;
+  document.getElementById('feedbackScore').className   = 'feedback-score '  + level;
+  document.getElementById('feedbackScore').textContent = score + '%';
+  document.getElementById('feedbackLabel').className   = 'feedback-label '  + level;
+  document.getElementById('feedbackLabel').textContent = labels[level];
+  document.getElementById('feedbackSub').textContent   = subs[level];
+  document.getElementById('feedbackDx').textContent    = ev.diagnostico_correcto || '—';
+  document.getElementById('feedbackPos').textContent   = ev.positivo || '—';
+  document.getElementById('feedbackMej').textContent   = ev.mejorar  || '—';
+  document.getElementById('feedbackTip').textContent   = ev.consejo  || '—';
+  document.getElementById('quizFeedback').classList.add('visible');
+  document.getElementById('quizFeedback').scrollIntoView({ behavior:'smooth', block:'nearest' });
+}
+
+window.resetQuiz = function() {
+  currentQuizData = null;
+  document.getElementById('quizArea').style.display = 'none';
+  document.getElementById('quizFeedback').classList.remove('visible');
+  document.getElementById('quizAnswer').value = '';
+  document.getElementById('quizQuery').value  = '';
+  document.getElementById('quizQuery').focus();
+};
+
+window.goQuiz = function() {
+  if (!currentResult) return;
+  document.getElementById('quizQuery').value = currentResult.titulo;
+  window.switchTab('quiz'); window.runQuiz();
+};
+
+function setQuizLoading(on) {
+  document.getElementById('quizLoading').classList.toggle('visible', on);
+  const btn = document.getElementById('quizBtn');
+  btn.disabled = on;
+  btn.innerHTML = on
+    ? '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> Generando...'
+    : '<i class="ti ti-brain"></i> Generar caso';
+}
+
+/* ══════════════════════════════════════════
+   EXPORT
+══════════════════════════════════════════ */
+window.showExport = () => document.getElementById('exportOverlay').classList.add('visible');
+window.hideExport = () => document.getElementById('exportOverlay').classList.remove('visible');
+
+window.exportAs = function(type) {
+  window.hideExport();
+  if (!currentResult) return;
+  if (type === 'copy') {
+    const d = currentResult;
+    let txt = `═══ GUÍA DIAGNÓSTICA ═══\n${d.titulo}\n`;
+    if (d.cie10) txt += `CIE-10: ${d.cie10}\n`;
+    txt += `Fuente: ${d.fuente}\n\nDEFINICIÓN:\n${d.definicion}\n\n`;
+    if (d.criterios_diagnosticos?.length) { txt += `CRITERIOS:\n`; d.criterios_diagnosticos.forEach(c => txt += `• [${c.tipo.toUpperCase()}] ${c.descripcion}\n`); txt += '\n'; }
+    if (d.pasos_diagnosticos?.length)     { txt += `PROCESO:\n`;   d.pasos_diagnosticos.forEach((s,i) => txt += `${i+1}. ${s}\n`); txt += '\n'; }
+    if (d.diagnostico_diferencial?.length) txt += `DX DIFERENCIAL:\n${d.diagnostico_diferencial.map(x=>'• '+x).join('\n')}\n`;
+    navigator.clipboard.writeText(txt).then(() => showToast('Copiado ✓')).catch(() => showToast('Error al copiar'));
+  } else if (type === 'print') {
+    window.print();
+  } else if (type === 'quiz') {
+    window.goQuiz();
+  }
+};
+
+/* ─── TOAST ─── */
+window.showToast = function(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2800);
+};
+
+/* ─── KEYBOARD ─── */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && document.activeElement.id === 'query')     window.runSearch();
+  if (e.key === 'Enter' && document.activeElement.id === 'quizQuery') window.runQuiz();
+  if (e.key === 'Escape') window.hideExport();
+});
+
+/* ─── INIT ─── */
+loadHistory();
+</script>
+
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --gd:#085041;--gm:#0F6E56;--gl:#1D9E75;--gp:#E1F5EE;--gmt:#9FE1CB;
+    --bg:#F7F8F6;--surface:#fff;--border:#E2E4DF;--border-s:#C8CCC6;
+    --text:#1A1C19;--text2:#52574F;--text3:#8A8E87;
+    --red-bg:#FCEBEB;--red-b:#F7C1C1;--red-t:#501313;
+    --amb-bg:#FAEEDA;--amb-b:#FAC775;--amb-t:#633806;
+    --blue-bg:#E6F1FB;--blue-b:#B5D4F4;--blue-t:#0C447C;
+    --r:10px;--rs:7px;--sh:0 1px 3px rgba(0,0,0,.08);--shm:0 4px 12px rgba(0,0,0,.1)
+  }
+  body{font-family:'IBM Plex Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+  .shell{max-width:860px;margin:0 auto;padding:2rem 1.25rem 4rem}
+
+  .app-header{display:flex;align-items:center;gap:14px;margin-bottom:2rem}
+  .logo{width:46px;height:46px;background:var(--gm);border-radius:12px;display:flex;align-items:center;justify-content:center;box-shadow:var(--sh)}
+  .logo i{font-size:24px;color:var(--gp)}
+  .app-header h1{font-size:20px;font-weight:600}
+  .app-header p{font-size:13px;color:var(--text3);margin-top:2px}
+
+  .tabs{display:flex;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:4px;margin-bottom:1.5rem;box-shadow:var(--sh)}
+  .tab{flex:1;padding:9px 10px;border:none;background:transparent;font-family:'IBM Plex Sans',sans-serif;font-size:13px;font-weight:500;color:var(--text3);cursor:pointer;border-radius:var(--rs);transition:all .15s;display:flex;align-items:center;justify-content:center;gap:7px}
+  .tab.active{background:var(--gp);color:var(--gm)}.tab:hover:not(.active){color:var(--text);background:var(--bg)}.tab i{font-size:15px}
+  .panel{display:none}.panel.active{display:block}
+
+  .search-box{display:flex;gap:10px;margin-bottom:1rem}
+  .search-input{flex:1;padding:12px 16px;font-size:15px;font-family:'IBM Plex Sans',sans-serif;border:1px solid var(--border-s);border-radius:var(--r);background:var(--surface);color:var(--text);outline:none;box-shadow:var(--sh);transition:border-color .2s,box-shadow .2s}
+  .search-input:focus{border-color:var(--gl);box-shadow:0 0 0 3px rgba(29,158,117,.12)}
+  .search-btn{padding:0 22px;background:var(--gm);color:#fff;border:none;border-radius:var(--r);font-size:14px;font-weight:500;cursor:pointer;display:flex;align-items:center;gap:8px;white-space:nowrap;font-family:'IBM Plex Sans',sans-serif;box-shadow:var(--sh);transition:background .15s,transform .1s}
+  .search-btn:hover{background:var(--gd)}.search-btn:active{transform:scale(.98)}.search-btn:disabled{background:var(--gmt);cursor:not-allowed}
+
+  .chips{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:1.5rem}
+  .chip{padding:5px 14px;border-radius:999px;border:1px solid var(--border-s);background:var(--surface);font-size:12px;cursor:pointer;color:var(--text2);transition:all .15s;box-shadow:var(--sh)}
+  .chip:hover{background:var(--gp);border-color:var(--gl);color:var(--gm)}
+
+  .loading-bar{display:none;align-items:center;gap:12px;padding:1.25rem;border-radius:var(--r);background:var(--surface);border:1px solid var(--border);margin-bottom:1.25rem;box-shadow:var(--sh)}
+  .loading-bar.visible{display:flex}
+  .spinner{width:18px;height:18px;border:2px solid var(--gmt);border-top-color:var(--gm);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .loading-msg{font-size:13px;color:var(--text2)}
+  .error-box{display:none;padding:1rem 1.25rem;background:var(--red-bg);border:1px solid var(--red-b);border-radius:var(--r);color:var(--red-t);font-size:13px;margin-bottom:1.25rem;align-items:center;gap:10px}
+  .error-box.visible{display:flex}.error-box i{font-size:18px;flex-shrink:0}
+
+  .result-card{display:none;border:1px solid var(--border);border-radius:var(--r);background:var(--surface);overflow:hidden;box-shadow:var(--shm)}
+  .result-card.visible{display:block}
+  .result-header{background:var(--gm);padding:1.25rem 1.5rem;display:flex;align-items:flex-start;justify-content:space-between;gap:1rem}
+  .result-header h2{font-size:19px;font-weight:600;color:var(--gp);line-height:1.3}
+  .source-badge{display:inline-flex;align-items:center;gap:5px;margin-top:7px;background:rgba(255,255,255,.15);padding:3px 11px;border-radius:999px;font-size:12px;color:var(--gmt)}
+  .cie-badge{background:rgba(255,255,255,.2);border-radius:var(--rs);padding:4px 11px;font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--gp);white-space:nowrap;flex-shrink:0;margin-top:2px}
+  .result-actions{display:flex;gap:8px;padding:.875rem 1.5rem;border-bottom:1px solid var(--border);background:#F3F9F6;flex-wrap:wrap}
+  .action-btn{padding:7px 16px;border:1px solid var(--border-s);border-radius:var(--rs);background:var(--surface);font-size:13px;font-weight:500;color:var(--text2);cursor:pointer;display:flex;align-items:center;gap:7px;font-family:'IBM Plex Sans',sans-serif;transition:all .15s;box-shadow:var(--sh)}
+  .action-btn:hover{background:var(--bg);color:var(--text);border-color:var(--gl)}
+  .action-btn.primary{background:var(--gm);color:#fff;border-color:var(--gm)}.action-btn.primary:hover{background:var(--gd)}
+
+  .section{padding:1.25rem 1.5rem;border-bottom:1px solid var(--border)}.section:last-child{border-bottom:none}
+  .section-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--gm);margin-bottom:12px;display:flex;align-items:center;gap:7px}.section-title i{font-size:14px}
+  .criteria-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+  .criteria-item{background:var(--bg);border-radius:var(--rs);padding:10px 13px;border-left:3px solid var(--gl)}
+  .criteria-item.major{border-left-color:#E24B4A}.criteria-item.minor{border-left-color:#EF9F27}.criteria-item.finding{border-left-color:#378ADD}.criteria-item.lab{border-left-color:#7F77DD}
+  .criteria-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);margin-bottom:4px}
+  .criteria-value{font-size:13px;color:var(--text);line-height:1.45}
+  .steps-list{display:flex;flex-direction:column;gap:8px}
+  .step-item{display:flex;align-items:flex-start;gap:12px;padding:10px 13px;background:var(--bg);border-radius:var(--rs)}
+  .step-num{width:24px;height:24px;background:var(--gm);color:#fff;border-radius:50%;font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+  .step-text{font-size:13px;color:var(--text);line-height:1.55}
+  .alert-box{display:flex;gap:10px;padding:11px 14px;border-radius:var(--rs);font-size:13px;line-height:1.5}
+  .alert-box.warning{background:var(--amb-bg);color:var(--amb-t);border:1px solid var(--amb-b)}
+  .alert-box.info{background:var(--blue-bg);color:var(--blue-t);border:1px solid var(--blue-b)}
+  .alert-box.danger{background:var(--red-bg);color:var(--red-t);border:1px solid var(--red-b)}
+  .alert-box i{font-size:16px;flex-shrink:0;margin-top:1px}
+  .pills-row{display:flex;flex-wrap:wrap;gap:6px}
+  .pill{padding:4px 13px;border-radius:999px;font-size:12px;font-weight:500}
+  .pill.green{background:#EAF3DE;color:#27500A}.pill.blue{background:var(--blue-bg);color:var(--blue-t)}.pill.amber{background:var(--amb-bg);color:var(--amb-t)}.pill.red{background:var(--red-bg);color:var(--red-t)}
+
+  .empty-state{text-align:center;padding:3.5rem 1rem;color:var(--text3)}
+  .empty-state i{font-size:44px;margin-bottom:14px;display:block;color:var(--gmt)}
+  .empty-state p{font-size:15px;color:var(--text2)}.empty-state small{font-size:13px;margin-top:6px;display:block}
+
+  .quiz-case{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:1.25rem 1.5rem;margin-bottom:1rem;box-shadow:var(--sh)}
+  .quiz-case h3{font-size:14px;font-weight:600;margin-bottom:.75rem;color:var(--gm);display:flex;align-items:center;gap:8px}
+  .quiz-case p{font-size:14px;line-height:1.7;color:var(--text)}
+  .quiz-answer-box{margin-bottom:1rem}
+  .quiz-answer-box textarea{width:100%;padding:12px 16px;font-size:14px;font-family:'IBM Plex Sans',sans-serif;border:1px solid var(--border-s);border-radius:var(--r);background:var(--surface);color:var(--text);resize:vertical;min-height:100px;outline:none;box-shadow:var(--sh);transition:border-color .2s}
+  .quiz-answer-box textarea:focus{border-color:var(--gl)}
+  .quiz-actions{display:flex;gap:8px;margin-bottom:1rem}
+  .quiz-feedback{display:none;border:1px solid var(--border);border-radius:var(--r);overflow:hidden;box-shadow:var(--shm)}
+  .quiz-feedback.visible{display:block}
+  .feedback-header{padding:1.1rem 1.5rem;display:flex;align-items:center;gap:14px}
+  .feedback-header.correct{background:#EAF3DE}.feedback-header.partial{background:var(--amb-bg)}.feedback-header.incorrect{background:var(--red-bg)}
+  .feedback-score{font-size:28px;font-weight:700}
+  .feedback-score.correct{color:#27500A}.feedback-score.partial{color:var(--amb-t)}.feedback-score.incorrect{color:var(--red-t)}
+  .feedback-label{font-size:14px;font-weight:600}
+  .feedback-label.correct{color:#3B6D11}.feedback-label.partial{color:#854F0B}.feedback-label.incorrect{color:#A32D2D}
+  .feedback-sub{font-size:12px;color:var(--text3);margin-top:2px}
+  .feedback-body{padding:1.25rem 1.5rem;background:var(--surface)}
+  .feedback-section{margin-bottom:1rem}.feedback-section:last-child{margin-bottom:0}
+  .feedback-section h4{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);margin-bottom:6px}
+  .feedback-section p{font-size:14px;line-height:1.6;color:var(--text)}
+
+  .history-list{display:flex;flex-direction:column;gap:8px}
+  .history-item{display:flex;align-items:center;gap:12px;padding:12px 16px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface);cursor:pointer;transition:all .15s;box-shadow:var(--sh)}
+  .history-item:hover{border-color:var(--gl);background:var(--gp)}
+  .history-icon{width:36px;height:36px;background:var(--gp);border-radius:var(--rs);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+  .history-icon i{font-size:18px;color:var(--gm)}
+  .history-info{flex:1;min-width:0}
+  .history-title{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .history-meta{font-size:12px;color:var(--text3);margin-top:2px}
+  .history-cie{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--gm);background:var(--gp);padding:3px 9px;border-radius:5px;flex-shrink:0}
+  .history-del{width:28px;height:28px;border:none;background:transparent;cursor:pointer;color:var(--text3);display:flex;align-items:center;justify-content:center;border-radius:6px;flex-shrink:0;transition:all .15s}
+  .history-del:hover{background:var(--red-bg);color:var(--red-t)}.history-del i{font-size:14px}
+  .history-clear-btn{display:flex;align-items:center;gap:6px;padding:7px 14px;border:1px solid var(--border-s);border-radius:var(--rs);background:transparent;font-size:12px;color:var(--text3);cursor:pointer;font-family:'IBM Plex Sans',sans-serif;margin-bottom:1rem;transition:all .15s}
+  .history-clear-btn:hover{color:var(--red-t);border-color:var(--red-b)}
+  .history-empty{text-align:center;padding:3rem 1rem;color:var(--text3)}.history-empty i{font-size:36px;margin-bottom:12px;display:block}
+
+  .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:100;align-items:center;justify-content:center}
+  .modal-overlay.visible{display:flex}
+  .modal{background:var(--surface);border-radius:var(--r);padding:1.75rem;width:300px;box-shadow:var(--shm);border:1px solid var(--border)}
+  .modal h3{font-size:16px;font-weight:600;margin-bottom:1rem}
+  .modal-opts{display:flex;flex-direction:column;gap:8px;margin-bottom:1rem}
+  .modal-opt{padding:11px 16px;border:1px solid var(--border);border-radius:var(--rs);cursor:pointer;display:flex;align-items:center;gap:12px;font-size:13px;color:var(--text);background:var(--bg);transition:all .15s;font-family:'IBM Plex Sans',sans-serif}
+  .modal-opt:hover{border-color:var(--gl);background:var(--gp);color:var(--gm)}.modal-opt i{font-size:18px}
+  .modal-cancel{width:100%;padding:9px;border:none;background:transparent;font-size:13px;color:var(--text3);cursor:pointer;font-family:'IBM Plex Sans',sans-serif}
+  .modal-cancel:hover{color:var(--text)}
+
+  .toast{position:fixed;bottom:2rem;left:50%;transform:translateX(-50%) translateY(2rem);background:#1A1C19;color:#fff;padding:10px 20px;border-radius:999px;font-size:13px;opacity:0;transition:all .25s;z-index:200;white-space:nowrap;pointer-events:none}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+  @media(max-width:600px){
+    .shell{padding:1rem .75rem 3rem}
+    .criteria-grid{grid-template-columns:1fr}
+    .result-actions{gap:6px}.action-btn{padding:6px 12px;font-size:12px}
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <div class="app-header">
+    <div class="logo"><i class="ti ti-stethoscope"></i></div>
+    <div>
+      <h1>Guías Diagnósticas</h1>
+      <p>GPC del IMSS · Normas Oficiales Mexicanas</p>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" id="tab-buscar" onclick="switchTab('buscar')"><i class="ti ti-search"></i> Consultar</button>
+    <button class="tab" id="tab-quiz" onclick="switchTab('quiz')"><i class="ti ti-brain"></i> Quiz</button>
+    <button class="tab" id="tab-historial" onclick="switchTab('historial')"><i class="ti ti-history"></i> Historial</button>
+  </div>
+
+  <!-- CONSULTAR -->
+  <div class="panel active" id="panel-buscar">
+    <div class="search-box">
+      <input class="search-input" id="query" type="text" placeholder="Ej: ¿Cómo se diagnostica la diabetes tipo 2?"/>
+      <button class="search-btn" id="searchBtn" onclick="runSearch()"><i class="ti ti-search"></i> Consultar</button>
+    </div>
+    <div class="chips">
+      <span class="chip" onclick="fillQuery('Diagnóstico de hipertensión arterial')">Hipertensión arterial</span>
+      <span class="chip" onclick="fillQuery('Diagnóstico de diabetes mellitus tipo 2')">Diabetes tipo 2</span>
+      <span class="chip" onclick="fillQuery('Diagnóstico de asma bronquial')">Asma bronquial</span>
+      <span class="chip" onclick="fillQuery('Diagnóstico de anemia ferropénica')">Anemia ferropénica</span>
+      <span class="chip" onclick="fillQuery('Diagnóstico de hipotiroidismo')">Hipotiroidismo</span>
+      <span class="chip" onclick="fillQuery('Diagnóstico de EPOC')">EPOC</span>
+      <span class="chip" onclick="fillQuery('Diagnóstico de insuficiencia cardíaca')">Insuficiencia cardíaca</span>
+      <span class="chip" onclick="fillQuery('Diagnóstico de neumonía adquirida en la comunidad')">Neumonía</span>
+    </div>
+    <div class="loading-bar" id="loading"><div class="spinner"></div><span class="loading-msg" id="loadingMsg">Consultando guías clínicas...</span></div>
+    <div class="error-box" id="errorBox"><i class="ti ti-alert-circle"></i><span id="errorMsg">Error.</span></div>
+    <div class="result-card" id="resultCard">
+      <div class="result-header">
+        <div><h2 id="diagTitle">—</h2><span class="source-badge"><i class="ti ti-file-text" style="font-size:11px"></i> <span id="sourceLabel">GPC-IMSS</span></span></div>
+        <div class="cie-badge" id="cieBadge" style="display:none"></div>
+      </div>
+      <div class="result-actions">
+        <button class="action-btn primary" onclick="showExport()"><i class="ti ti-download"></i> Exportar</button>
+        <button class="action-btn" id="saveBtn" onclick="saveToHistory()"><i class="ti ti-bookmark"></i> Guardar</button>
+        <button class="action-btn" onclick="goQuiz()"><i class="ti ti-brain"></i> Hacer quiz</button>
+      </div>
+      <div id="resultBody"></div>
+    </div>
+    <div class="empty-state" id="emptyState">
+      <i class="ti ti-microscope"></i>
+      <p>Escribe una enfermedad o condición clínica</p>
+      <small>La guía diagnóstica aparecerá aquí basada en fuentes oficiales mexicanas</small>
+    </div>
+  </div>
+
+  <!-- QUIZ -->
+  <div class="panel" id="panel-quiz">
+    <div style="margin-bottom:1rem">
+      <p style="font-size:14px;color:var(--text2);line-height:1.6;margin-bottom:1rem">Ingresa una enfermedad para generar un caso clínico. Intenta el diagnóstico antes de ver la respuesta.</p>
+      <div class="search-box">
+        <input class="search-input" id="quizQuery" type="text" placeholder="Ej: diabetes, neumonía, lupus..."/>
+        <button class="search-btn" id="quizBtn" onclick="runQuiz()"><i class="ti ti-brain"></i> Generar caso</button>
+      </div>
+      <div class="chips">
+        <span class="chip" onclick="document.getElementById('quizQuery').value='insuficiencia cardíaca'">Insuficiencia cardíaca</span>
+        <span class="chip" onclick="document.getElementById('quizQuery').value='hipotiroidismo'">Hipotiroidismo</span>
+        <span class="chip" onclick="document.getElementById('quizQuery').value='neumonía'">Neumonía</span>
+        <span class="chip" onclick="document.getElementById('quizQuery').value='lupus eritematoso'">Lupus</span>
+        <span class="chip" onclick="document.getElementById('quizQuery').value='apendicitis aguda'">Apendicitis</span>
+      </div>
+    </div>
+    <div class="loading-bar" id="quizLoading"><div class="spinner"></div><span class="loading-msg" id="quizMsg">Generando caso clínico...</span></div>
+    <div id="quizArea" style="display:none">
+      <div class="quiz-case"><h3><i class="ti ti-notes-medical"></i> Caso clínico</h3><p id="quizCaseText"></p></div>
+      <div class="quiz-answer-box"><textarea id="quizAnswer" placeholder="Escribe tu diagnóstico y justificación clínica aquí..."></textarea></div>
+      <div class="quiz-actions">
+        <button class="search-btn" id="evalBtn" onclick="evaluateQuiz()" style="flex:1;justify-content:center;padding:11px"><i class="ti ti-check"></i> Evaluar mi respuesta</button>
+        <button class="action-btn" onclick="resetQuiz()" style="padding:11px 16px"><i class="ti ti-refresh"></i> Nuevo caso</button>
+      </div>
+      <div class="quiz-feedback" id="quizFeedback">
+        <div class="feedback-header" id="feedbackHeader">
+          <div class="feedback-score" id="feedbackScore"></div>
+          <div><div class="feedback-label" id="feedbackLabel"></div><div class="feedback-sub" id="feedbackSub"></div></div>
+        </div>
+        <div class="feedback-body">
+          <div class="feedback-section"><h4>Diagnóstico correcto</h4><p id="feedbackDx"></p></div>
+          <div class="feedback-section"><h4>Lo que hiciste bien</h4><p id="feedbackPos"></p></div>
+          <div class="feedback-section"><h4>Puntos a reforzar</h4><p id="feedbackMej"></p></div>
+          <div class="feedback-section"><h4>Consejo clínico</h4><p id="feedbackTip"></p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HISTORIAL -->
+  <div class="panel" id="panel-historial"><div id="historyContent"></div></div>
+
+</div>
+
+<div class="modal-overlay" id="exportOverlay">
+  <div class="modal">
+    <h3>Exportar guía diagnóstica</h3>
+    <div class="modal-opts">
+      <div class="modal-opt" onclick="exportAs('copy')"><i class="ti ti-copy"></i> Copiar al portapapeles</div>
+      <div class="modal-opt" onclick="exportAs('print')"><i class="ti ti-printer"></i> Imprimir / Guardar PDF</div>
+      <div class="modal-opt" onclick="exportAs('quiz')"><i class="ti ti-brain"></i> Convertir en quiz</div>
+    </div>
+    <button class="modal-cancel" onclick="hideExport()">Cancelar</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+</body>
+</html>
