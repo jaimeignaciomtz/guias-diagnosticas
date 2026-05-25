@@ -64,7 +64,7 @@ let fsHistory       = [];
    CLAUDE API
 ══════════════════════════════════════════ */
 async function callClaude(system, userMsg, useSearch) {
-  const r = await fetch('/api/claude', {
+  const r = await fetch('/.netlify/functions/claude', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ system, messages: [{ role: 'user', content: userMsg }], useSearch })
