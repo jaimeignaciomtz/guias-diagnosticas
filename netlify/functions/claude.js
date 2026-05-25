@@ -9,16 +9,13 @@ exports.handler = async function (event) {
   if (event.httpMethod !== "POST") return { statusCode: 405, headers, body: JSON.stringify({ error: "Method Not Allowed" }) };
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return { statusCode: 500, headers, body: JSON.stringify({ error: "ANTHROPIC_API_KEY no configurada" }) };
-  }
+  if (!apiKey) return { statusCode: 500, headers, body: JSON.stringify({ error: "ANTHROPIC_API_KEY no configurada" }) };
 
   let body;
-  try {
-    body = JSON.parse(event.body);
-  } catch (e) {
-    return { statusCode: 400, headers, body: JSON.stringify({ error: "Body invalido" }) };
-  }
+  try { body = JSON.parse(event.body); }
+  catch (e) { return { statusCode: 400, headers, body: JSON.stringify({ error: "Body invalido" }) }; }
+
+  const systemPrompt = (body.system || '') + '\n\nIMPORTANTE: Tu respuesta debe ser JSON valido. No uses comillas dobles dentro de los valores de texto. Si necesitas citar algo, usa comillas simples. No uses caracteres especiales que rompan el JSON.';
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -30,8 +27,8 @@ exports.handler = async function (event) {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-5",
-        max_tokens: 1500,
-        system: body.system,
+        max_tokens: 2000,
+        system: systemPrompt,
         messages: body.messages,
       }),
     });
@@ -43,6 +40,6 @@ exports.handler = async function (event) {
       body: text,
     };
   } catch (err) {
-    return { statusCode: 500, headers, body: JSON.stringify({ error: err.message }) };
+    return { statusCode: 500, headers, body: JSON.stringify({ error: String(err.message || err) }) };
   }
 };
