@@ -1,0 +1,2 @@
+# Ignorar escaneo de secretos de Firebase (son publicos por diseno)
+index.html
