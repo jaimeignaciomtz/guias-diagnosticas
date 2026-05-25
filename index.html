@@ -69,8 +69,14 @@ async function callClaude(system, userMsg, useSearch) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ system, messages: [{ role: 'user', content: userMsg }], useSearch })
   });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  const text = await r.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch(e) {
+    throw new Error('Respuesta inválida del servidor: ' + text.slice(0, 100));
+  }
+  if (!r.ok) throw new Error(data.error || 'HTTP ' + r.status);
   const txt = data.content?.find(b => b.type === 'text');
   if (!txt) throw new Error('Sin respuesta de texto');
   return JSON.parse(txt.text.replace(/```json|```/g, '').trim());
