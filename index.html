@@ -81,6 +81,7 @@ async function callClaude(system, userMsg, useSearch) {
 const firstBrace = jsonStr.indexOf('{');
 const lastBrace = jsonStr.lastIndexOf('}');
 if (firstBrace !== -1 && lastBrace !== -1) jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
+jsonStr = jsonStr.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ');
 return JSON.parse(jsonStr);
   } catch(e) {
     throw new Error(e.message || String(e));
