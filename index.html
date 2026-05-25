@@ -77,11 +77,15 @@ async function callClaude(system, userMsg, useSearch) {
     catch(e) { throw new Error('Respuesta inválida: ' + text.slice(0, 100)); }
     const txt = data.content?.find(b => b.type === 'text');
     if (!txt) throw new Error('Sin respuesta de texto. Respuesta: ' + JSON.stringify(data).slice(0, 200));
-    let jsonStr = txt.text.replace(/```json|```/g, '').trim();
+   let jsonStr = txt.text.replace(/```json|```/g, '').trim();
 const firstBrace = jsonStr.indexOf('{');
 const lastBrace = jsonStr.lastIndexOf('}');
 if (firstBrace !== -1 && lastBrace !== -1) jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
-jsonStr = jsonStr.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ');
+jsonStr = jsonStr
+  .replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ')
+  .replace(/:\s*"([^"]*?)"/g, (match, p1) => ': "' + p1.replace(/"/g, "'") + '"')
+  .replace(/,\s*}/g, '}')
+  .replace(/,\s*]/g, ']');
 return JSON.parse(jsonStr);
   } catch(e) {
     throw new Error(e.message || String(e));
