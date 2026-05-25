@@ -123,7 +123,7 @@ window.runSearch = async function() {
     renderResult(result);
   } catch(e) {
     clearInterval(iv);
-    showError('No se pudo obtener la guía: ' + e.message);
+    showError('No se pudo obtener la guía: ' + (typeof e === 'string' ? e : e.message || JSON.stringify(e)));
     document.getElementById('emptyState').style.display = 'block';
   } finally { setLoading(false); }
 };
