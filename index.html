@@ -148,60 +148,46 @@ function renderResult(data) {
   const alertIco = {warning:'ti-alert-triangle',danger:'ti-urgent',info:'ti-info-circle'};
   const catPill  = {normal:'green',alterado:'amber',critico:'red'};
 
-  let html = '';
+ let html = '';
   if (data.definicion)
     html += `<div class="section"><div class="section-title"><i class="ti ti-info-circle"></i> Definición clínica</div><p style="font-size:14px;line-height:1.65">${data.definicion}</p></div>`;
 
-  if (data.criterios_diagnosticos?.length) {
+  if (data.criterios?.length) {
+    const clsMap = {mayor:'major',menor:'minor',lab:'lab'};
+    const labels  = {mayor:'Criterio mayor',menor:'Criterio menor',lab:'Laboratorio'};
     html += `<div class="section"><div class="section-title"><i class="ti ti-list-check"></i> Criterios diagnósticos</div><div class="criteria-grid">`;
-    for (const c of data.criterios_diagnosticos)
-      html += `<div class="criteria-item ${clsMap[c.tipo]||''}"><div class="criteria-label">${labels[c.tipo]||c.tipo}</div><div class="criteria-value">${c.descripcion}</div></div>`;
+    for (const c of data.criterios)
+      html += `<div class="criteria-item ${clsMap[c.tipo]||'finding'}"><div class="criteria-label">${labels[c.tipo]||c.tipo}</div><div class="criteria-value">${c.desc}</div></div>`;
     html += `</div></div>`;
   }
-  if (data.pasos_diagnosticos?.length) {
+  if (data.pasos?.length) {
     html += `<div class="section"><div class="section-title"><i class="ti ti-route"></i> Proceso diagnóstico</div><div class="steps-list">`;
-    data.pasos_diagnosticos.forEach((s,i) =>
-      html += `<div class="step-item"><div class="step-num">${i+1}</div><div class="step-text">${s.replace(/^Paso\s*\d+[:.\s]*/i,'')}</div></div>`);
-    html += `</div></div>`;
-  }
-  if (data.valores_de_corte?.length) {
-    html += `<div class="section"><div class="section-title"><i class="ti ti-ruler-measure"></i> Valores de corte</div><div class="criteria-grid">`;
-    for (const v of data.valores_de_corte)
-      html += `<div class="criteria-item lab" style="display:flex;flex-direction:column;gap:6px">
-        <div class="criteria-label">${v.parametro}</div>
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
-          <span style="font-size:14px;font-weight:500">${v.valor}</span>
-          <span class="pill ${catPill[v.categoria]||'blue'}" style="font-size:11px">${v.categoria}</span>
-        </div></div>`;
+    data.pasos.forEach((s,i) =>
+      html += `<div class="step-item"><div class="step-num">${i+1}</div><div class="step-text">${s}</div></div>`);
     html += `</div></div>`;
   }
   if (data.tratamiento) {
     html += `<div class="section"><div class="section-title"><i class="ti ti-pill"></i> Tratamiento</div>`;
-    if (data.tratamiento.farmacologico?.length) {
+    if (data.tratamiento.farma?.length) {
       html += `<div class="criteria-label" style="margin-bottom:8px">Farmacológico</div><div class="steps-list">`;
-      data.tratamiento.farmacologico.forEach((t,i) => html += `<div class="step-item"><div class="step-num">${i+1}</div><div class="step-text">${t}</div></div>`);
+      data.tratamiento.farma.forEach((t,i) => html += `<div class="step-item"><div class="step-num">${i+1}</div><div class="step-text">${t}</div></div>`);
       html += `</div>`;
     }
-    if (data.tratamiento.no_farmacologico?.length) {
+    if (data.tratamiento.no_farma?.length) {
       html += `<div class="criteria-label" style="margin-top:12px;margin-bottom:8px">No farmacológico</div><div class="pills-row">`;
-      data.tratamiento.no_farmacologico.forEach(t => html += `<span class="pill green">${t}</span>`);
+      data.tratamiento.no_farma.forEach(t => html += `<span class="pill green">${t}</span>`);
       html += `</div>`;
-    }
-    if (data.tratamiento.seguimiento) {
-      html += `<div class="alert-box info" style="margin-top:12px"><i class="ti ti-calendar"></i><span>${data.tratamiento.seguimiento}</span></div>`;
     }
     html += `</div>`;
   }
-  if (data.diagnostico_diferencial?.length) {
+  if (data.diferencial?.length) {
     html += `<div class="section"><div class="section-title"><i class="ti ti-arrows-diff"></i> Diagnóstico diferencial</div><div class="pills-row">`;
-    for (const dd of data.diagnostico_diferencial) html += `<span class="pill blue">${dd}</span>`;
+    for (const dd of data.diferencial) html += `<span class="pill blue">${dd}</span>`;
     html += `</div></div>`;
   }
-  if (data.alertas?.length) {
-    html += `<div class="section"><div class="section-title"><i class="ti ti-alert-triangle"></i> Alertas clínicas</div><div style="display:flex;flex-direction:column;gap:8px">`;
-    for (const a of data.alertas)
-      html += `<div class="alert-box ${a.tipo}"><i class="ti ${alertIco[a.tipo]||'ti-info-circle'}"></i><span>${a.mensaje}</span></div>`;
-    html += `</div></div>`;
+  if (data.alerta) {
+    html += `<div class="section"><div class="section-title"><i class="ti ti-alert-triangle"></i> Alerta clínica</div>
+      <div class="alert-box warning"><i class="ti ti-alert-triangle"></i><span>${data.alerta}</span></div></div>`;
   }
 
   document.getElementById('resultBody').innerHTML = html;
