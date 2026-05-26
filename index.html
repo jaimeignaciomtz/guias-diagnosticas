@@ -176,6 +176,23 @@ function renderResult(data) {
         </div></div>`;
     html += `</div></div>`;
   }
+  if (data.tratamiento) {
+    html += `<div class="section"><div class="section-title"><i class="ti ti-pill"></i> Tratamiento</div>`;
+    if (data.tratamiento.farmacologico?.length) {
+      html += `<div class="criteria-label" style="margin-bottom:8px">Farmacológico</div><div class="steps-list">`;
+      data.tratamiento.farmacologico.forEach((t,i) => html += `<div class="step-item"><div class="step-num">${i+1}</div><div class="step-text">${t}</div></div>`);
+      html += `</div>`;
+    }
+    if (data.tratamiento.no_farmacologico?.length) {
+      html += `<div class="criteria-label" style="margin-top:12px;margin-bottom:8px">No farmacológico</div><div class="pills-row">`;
+      data.tratamiento.no_farmacologico.forEach(t => html += `<span class="pill green">${t}</span>`);
+      html += `</div>`;
+    }
+    if (data.tratamiento.seguimiento) {
+      html += `<div class="alert-box info" style="margin-top:12px"><i class="ti ti-calendar"></i><span>${data.tratamiento.seguimiento}</span></div>`;
+    }
+    html += `</div>`;
+  }
   if (data.diagnostico_diferencial?.length) {
     html += `<div class="section"><div class="section-title"><i class="ti ti-arrows-diff"></i> Diagnóstico diferencial</div><div class="pills-row">`;
     for (const dd of data.diagnostico_diferencial) html += `<span class="pill blue">${dd}</span>`;
